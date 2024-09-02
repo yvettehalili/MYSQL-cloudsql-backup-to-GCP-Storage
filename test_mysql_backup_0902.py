@@ -30,36 +30,6 @@ config.read(CREDENTIALS_PATH)
 DB_USR = config['credentials']['DB_USR']
 DB_PWD = config['credentials']['DB_PWD']
 
-EMAIL_SCRIPT_PATH = "/backup/scripts/test_error_backup_email.py"
-
-def sanitize_command(command):
-    """Sanitize the command by replacing sensitive information."""
-    sanitized_command = [
-        arg.replace(DB_USR, "*****").replace(DB_PWD, "*****") if isinstance(arg, str) else arg
-    for arg in command]
-    return sanitized_command
-
-def send_error_email():
-    subject = "[ERROR] CloudSQL Backup Error"
-    error_lines = []
-
-    # Read the log file and capture lines containing "ERROR"
-    with open(log_filename) as log_file:
-        for line in log_file:
-            if "ERROR" in line:
-                error_lines.append(line.strip())
-
-    # Join the error lines into a single string with HTML line breaks
-    body = '<br>'.join(error_lines)
-
-    command = [
-        "python3", EMAIL_SCRIPT_PATH, subject, body
-    ]
-    try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as e:
-        logging.error("Failed to send error email: {}".format(e))
-
 def load_server_list(file_path):
     """Load the server list from a given file."""
     config = configparser.ConfigParser()
@@ -68,7 +38,6 @@ def load_server_list(file_path):
         return config.sections(), config
     except Exception as e:
         logging.error("Failed to load server list: {}".format(e))
-        send_error_email()
         return [], None
 
 def get_database_list(host, use_ssl, server):
@@ -89,6 +58,7 @@ def get_database_list(host, use_ssl, server):
                 "--ssl-mode=VERIFY_CA", "--default-auth=mysql_native_password",
                 "-B", "--silent", "-e", "SHOW DATABASES"
             ]
+
         result = subprocess.check_output(command, stderr=subprocess.STDOUT)
         db_list = result.decode("utf-8").strip().split('\n')
         valid_db_list = [
@@ -96,56 +66,64 @@ def get_database_list(host, use_ssl, server):
                 "information_schema", "performance_schema", "sys", "mysql"
             )
         ]
+
         return valid_db_list
     except subprocess.CalledProcessError as e:
         logging.error("Failed to get database list from {}: {} - Output: {}".format(
             host, e, e.output.decode()
         ))
-        send_error_email()
         return []
 
 def stream_database_to_gcs(dump_command, gcs_path, db):
     start_time = time.time()
+
     try:
-        sanitized_command = sanitize_command(dump_command)
-        logging.info("Starting dump process: {}".format(" ".join(sanitized_command)))
-        
+        logging.info("Starting dump process: {}".format(" ".join(dump_command)))
+
         # Start the dump process
         dump_proc = subprocess.Popen(dump_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
         logging.info("Starting gzip process")
-        
         # Start the gzip process
         gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         dump_proc.stdout.close()  # Allow dump_proc to receive a SIGPIPE if gzip_proc exits
-        
+
         # Initialize Google Cloud Storage client
         client = storage.Client.from_service_account_json(KEY_FILE)
         bucket = client.bucket(BUCKET)
         blob = bucket.blob(gcs_path)
+
         logging.info("Starting GCS upload process")
-        
+        # Stream data to GCS
         with io.BytesIO() as memfile:
-            for chunk in iter(lambda: gzip_proc.stdout.read(4096), b''):
+            while True:
+                chunk = gzip_proc.stdout.read(4096)
+                if not chunk:
+                    break
                 memfile.write(chunk)
+
             memfile.seek(0)
             blob.upload_from_file(memfile, content_type='application/gzip')
-        
-        # Wait for processes to complete and check for errors
-        dump_proc.communicate()
-        gzip_proc.communicate()
+
+        dump_output, dump_err = dump_proc.communicate()
+        gzip_output, gzip_err = gzip_proc.communicate()
 
         if dump_proc.returncode != 0:
-            logging.error("mysqldump failed: {}".format(dump_proc.stderr.read().decode() if dump_proc.stderr else 'No error message'))
-            return
+            logging.error("mysqldump failed: {}".format(dump_err.decode() if dump_err else 'No error message'))
+            raise subprocess.CalledProcessError(dump_proc.returncode, dump_command)
         if gzip_proc.returncode != 0:
-            logging.error("gzip failed: {}".format(gzip_proc.stderr.read().decode() if gzip_proc.stderr else 'No error message'))
-            return
+            logging.error("gzip failed: {}".format(gzip_err.decode() if gzip_err else 'No error message'))
+            raise subprocess.CalledProcessError(gzip_proc.returncode, ["gzip"])
 
         elapsed_time = time.time() - start_time
         logging.info("Dumped and streamed database {} to GCS successfully in {:.2f} seconds.".format(db, elapsed_time))
+
+    except subprocess.CalledProcessError as e:
+        logging.error("Subprocess error: {} - Output: {}".format(e, e.output.decode() if e.output else 'No error message'))
+        raise
     except Exception as e:
         logging.error("Unexpected error streaming database {} to GCS: {}".format(db, e))
-        send_error_email()
+        raise
 
 def main():
     """Main function to execute the backup process."""
@@ -156,6 +134,7 @@ def main():
         return
     logging.info("================================== {} =============================================".format(current_date))
     logging.info("==== Backup Process Started ====")
+    
     servers = []
     for section in sections:
         try:
@@ -164,18 +143,21 @@ def main():
             servers.append((section, host, ssl))
         except KeyError as e:
             logging.error("Missing configuration for server '{}': {}".format(section, e))
-            send_error_email()
+
     for server in servers:
         SERVER, HOST, SSL = server
         use_ssl = SSL.lower() == "y"
         logging.info("DUMPING SERVER: {}".format(SERVER))
+
         try:
             db_list = get_database_list(HOST, use_ssl, SERVER)
             if not db_list:
                 logging.warning("No databases found for server: {}".format(SERVER))
                 continue
+
             for db in db_list:
                 logging.info("Backing up database: {}".format(db))
+
                 gcs_path = os.path.join(GCS_PATH, SERVER, "{}_{}.sql.gz".format(current_date, db))
                 dump_command = [
                     "mysqldump", "-u{}".format(DB_USR), "-p{}".format(DB_PWD), "-h", HOST, db,
@@ -189,13 +171,13 @@ def main():
                         "--ssl-key={}".format(os.path.join(SSL_PATH, SERVER, "client-key.pem")),
                         "--ssl-mode=VERIFY_CA"
                     ]
-                sanitized_command = sanitize_command(dump_command)
-                logging.info("Dump command: {}".format(" ".join(sanitized_command)))
+
+                logging.info("Dump command: {}".format(" ".join(dump_command)))
                 stream_database_to_gcs(dump_command, gcs_path, db)
+
         except Exception as e:
             logging.error("Error processing server {}: {}".format(SERVER, e))
-            send_error_email()
-            
+
     logging.info("==== Backup Process Completed ====")
 
 if __name__ == "__main__":
