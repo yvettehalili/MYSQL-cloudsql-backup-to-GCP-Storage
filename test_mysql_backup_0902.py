@@ -36,7 +36,8 @@ def sanitize_command(command):
     """Sanitize the command by replacing sensitive information."""
     sanitized_command = [
         arg.replace(DB_USR, "*****").replace(DB_PWD, "*****") if isinstance(arg, str) else arg
-    for arg in command]
+        for arg in command
+    ]
     return sanitized_command
 
 def send_error_email():
@@ -129,7 +130,7 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
             for chunk in iter(lambda: gzip_proc.stdout.read(4096), b''):
                 memfile.write(chunk)
                 total_bytes_uploaded += len(chunk)
-                logging.info(f"Uploaded {total_bytes_uploaded} bytes...")
+                logging.info("Uploaded {} bytes...".format(total_bytes_uploaded))
             memfile.seek(0)
             blob.upload_from_file(memfile, content_type='application/gzip')
 
