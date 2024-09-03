@@ -126,11 +126,8 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
 
         # Stream the compressed data to GCS
         with io.BytesIO() as memfile:
-            total_bytes_uploaded = 0
             for chunk in iter(lambda: gzip_proc.stdout.read(4096), b''):
                 memfile.write(chunk)
-                total_bytes_uploaded += len(chunk)
-                logging.info("Uploaded {} bytes...".format(total_bytes_uploaded))
             memfile.seek(0)
             blob.upload_from_file(memfile, content_type='application/gzip')
 
